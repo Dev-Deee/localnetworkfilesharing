@@ -1,18 +1,24 @@
 package main
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
 )
+
+//go:embed static/*
+var staticFiles embed.FS
 
 var uploadDir = "./uploads"
 
@@ -73,37 +79,29 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	r.ParseMultipartForm(500 << 20)
-
 	file, handler, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "Error retrieving file", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
-
 	os.MkdirAll(uploadDir, os.ModePerm)
-
 	fileName := fmt.Sprintf("%d_%s", time.Now().UnixNano(), handler.Filename)
 	destPath := filepath.Join(uploadDir, fileName)
-
 	dst, err := os.Create(destPath)
 	if err != nil {
 		http.Error(w, "Error saving file", http.StatusInternalServerError)
 		return
 	}
 	defer dst.Close()
-
 	size, err := io.Copy(dst, file)
 	if err != nil {
 		http.Error(w, "Error writing file", http.StatusInternalServerError)
 		return
 	}
-
 	localIP := getLocalIP()
 	downloadURL := fmt.Sprintf("http://%s:8080/download/%s", localIP, fileName)
-
 	qrFileName := fileName + "_qr.png"
 	qrPath := filepath.Join(uploadDir, qrFileName)
 	err = qrcode.WriteFile(downloadURL, qrcode.Medium, 256, qrPath)
@@ -111,19 +109,15 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error generating QR code", http.StatusInternalServerError)
 		return
 	}
-
 	qrURL := fmt.Sprintf("http://%s:8080/qr/%s", localIP, qrFileName)
-
 	resp := UploadResponse{
 		DownloadURL: downloadURL,
 		QRCodeURL:   qrURL,
 		FileName:    handler.Filename,
 		FileSize:    size,
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
-
 	go func() {
 		time.Sleep(1 * time.Hour)
 		os.Remove(destPath)
@@ -134,7 +128,6 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	fileName := filepath.Base(r.URL.Path)
 	filePath := filepath.Join(uploadDir, fileName)
-
 	file, err := os.Open(filePath)
 	if err != nil {
 		http.Error(w, "File not found", http.StatusNotFound)
@@ -142,18 +135,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	stat, _ := file.Stat()
-	originalName := fileName
-	for i, c := range fileName {
-		if c == '_' && i > 0 {
-			originalName = fileName[i+1:]
-			break
-		}
-	}
-
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, originalName))
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
-	http.ServeContent(w, r, originalName, stat.ModTime(), file)
+	http.ServeFile(w, r, filePath)
 }
 
 func qrHandler(w http.ResponseWriter, r *http.Request) {
@@ -168,12 +150,20 @@ func main() {
 	mux.HandleFunc("/download/", downloadHandler)
 	mux.HandleFunc("/qr/", qrHandler)
 
+	stripped, _ := fs.Sub(staticFiles, "static")
+	mux.Handle("/", http.FileServer(http.FS(stripped)))
+
 	handler := corsMiddleware(mux)
 
 	localIP := getLocalIP()
-	fmt.Printf("FileShare backend running\n")
-	fmt.Printf("Local:   http://localhost:8080\n")
+	fmt.Println("DropSend is running!")
+	fmt.Println("Open: http://localhost:8080")
 	fmt.Printf("Network: http://%s:8080\n", localIP)
+
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		exec.Command("xdg-open", "http://localhost:8080").Start()
+	}()
 
 	log.Fatal(http.ListenAndServe(":8080", handler))
 }
