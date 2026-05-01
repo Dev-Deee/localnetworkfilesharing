@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
@@ -14,8 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
@@ -27,10 +29,11 @@ var staticFiles embed.FS
 const (
 	port           = ":8080"
 	uploadDir      = "./uploads"
-	maxFileSize    = 200 << 20 // 200MB
+	maxFileSize    = 200 << 20
 	multicastAddr  = "224.0.0.167:9999"
 	beaconInterval = 3 * time.Second
 	peerTimeout    = 10 * time.Second
+	scanInterval   = 30 * time.Second
 )
 
 type UploadResponse struct {
@@ -54,20 +57,30 @@ type Peer struct {
 	LastSeen time.Time `json:"lastSeen"`
 }
 
+type NetworkDevice struct {
+	IP          string `json:"ip"`
+	Hostname    string `json:"hostname"`
+	MAC         string `json:"mac"`
+	HasDropSend bool   `json:"hasDropSend"`
+	Name        string `json:"name"`
+}
+
 type BeaconMessage struct {
 	Name string `json:"name"`
 	IP   string `json:"ip"`
 }
 
 var (
-	fileStore     = make(map[string]FileRecord)
-	fileStoreMu   sync.RWMutex
-	peers         = make(map[string]Peer)
-	peersMu       sync.RWMutex
-	displayName   string
-	localIP       string
-	uploadTimes   = make(map[string][]time.Time)
-	uploadTimesMu sync.Mutex
+	fileStore      = make(map[string]FileRecord)
+	fileStoreMu    sync.RWMutex
+	peers          = make(map[string]Peer)
+	peersMu        sync.RWMutex
+	networkDevices = make(map[string]NetworkDevice)
+	networkMu      sync.RWMutex
+	displayName    string
+	localIP        string
+	uploadTimes    = make(map[string][]time.Time)
+	uploadTimesMu  sync.Mutex
 )
 
 func generateToken() string {
@@ -106,6 +119,14 @@ func getLocalIP() string {
 		}
 	}
 	return "localhost"
+}
+
+func getSubnetPrefix(ip string) string {
+	parts := strings.Split(ip, ".")
+	if len(parts) != 4 {
+		return ""
+	}
+	return strings.Join(parts[:3], ".")
 }
 
 func getHostname() string {
@@ -148,6 +169,144 @@ func corsMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// ── NETWORK SCANNER ──────────────────────────────────────────
+
+// Ping a single IP (non-blocking, fire and forget)
+func pingIP(ip string) {
+	exec.Command("ping", "-c", "1", "-W", "1", ip).Run()
+}
+
+// Parse ARP table to get all known devices on the subnet
+func readARPTable(subnetPrefix string) []NetworkDevice {
+	out, err := exec.Command("arp", "-a").Output()
+	if err != nil {
+		return nil
+	}
+
+	var devices []NetworkDevice
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Format: hostname (ip) at mac [ether] on iface
+		// or: ? (ip) at mac [ether] on iface
+		if !strings.Contains(line, subnetPrefix) {
+			continue
+		}
+
+		// Extract IP
+		start := strings.Index(line, "(")
+		end := strings.Index(line, ")")
+		if start == -1 || end == -1 {
+			continue
+		}
+		ip := line[start+1 : end]
+		if ip == localIP {
+			continue
+		}
+
+		// Extract hostname
+		hostname := "?"
+		if start > 0 {
+			hostname = strings.TrimSpace(line[:start])
+			if hostname == "" || hostname == "?" {
+				hostname = "Unknown Device"
+			}
+		}
+
+		// Extract MAC
+		mac := ""
+		parts := strings.Fields(line)
+		for i, p := range parts {
+			if p == "at" && i+1 < len(parts) {
+				mac = parts[i+1]
+				break
+			}
+		}
+
+		// Skip incomplete entries
+		if mac == "" || mac == "<incomplete>" {
+			continue
+		}
+
+		devices = append(devices, NetworkDevice{
+			IP:       ip,
+			Hostname: hostname,
+			MAC:      mac,
+		})
+	}
+	return devices
+}
+
+// Full subnet scan: ping sweep then read ARP
+func scanNetwork() {
+	subnet := getSubnetPrefix(localIP)
+	if subnet == "" {
+		return
+	}
+
+	log.Printf("Scanning network %s.0/24...", subnet)
+
+	// Ping sweep concurrently
+	var wg sync.WaitGroup
+	for i := 1; i <= 254; i++ {
+		ip := fmt.Sprintf("%s.%d", subnet, i)
+		if ip == localIP {
+			continue
+		}
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			pingIP(target)
+		}(ip)
+	}
+	wg.Wait()
+
+	// Give ARP table time to settle
+	time.Sleep(2 * time.Second)
+
+	// Read ARP table
+	devices := readARPTable(subnet)
+
+	// Get current DropSend peers for cross-reference
+	peersMu.RLock()
+	currentPeers := make(map[string]Peer)
+	for k, v := range peers {
+		currentPeers[k] = v
+	}
+	peersMu.RUnlock()
+
+	// Update network devices map
+	networkMu.Lock()
+	networkDevices = make(map[string]NetworkDevice)
+	for _, d := range devices {
+		peer, hasPeer := currentPeers[d.IP]
+		if hasPeer {
+			d.HasDropSend = true
+			d.Name = peer.Name
+		} else {
+			d.HasDropSend = false
+			d.Name = d.Hostname
+		}
+		networkDevices[d.IP] = d
+	}
+	networkMu.Unlock()
+
+	log.Printf("Network scan complete: found %d devices", len(devices))
+}
+
+func startNetworkScanner() {
+	// First scan after 5 seconds (let app settle)
+	time.Sleep(5 * time.Second)
+	scanNetwork()
+
+	for {
+		time.Sleep(scanInterval)
+		scanNetwork()
+	}
+}
+
+// ── HANDLERS ─────────────────────────────────────────────────
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -272,6 +431,55 @@ func peersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(list)
+}
+
+func networkHandler(w http.ResponseWriter, r *http.Request) {
+	// Merge network devices with live DropSend peers
+	peersMu.RLock()
+	livePeers := make(map[string]Peer)
+	for k, v := range peers {
+		if time.Since(v.LastSeen) < peerTimeout {
+			livePeers[k] = v
+		}
+	}
+	peersMu.RUnlock()
+
+	networkMu.RLock()
+	result := []NetworkDevice{}
+	seen := make(map[string]bool)
+
+	// Add all network-scanned devices
+	for _, d := range networkDevices {
+		if peer, ok := livePeers[d.IP]; ok {
+			d.HasDropSend = true
+			d.Name = peer.Name
+		}
+		result = append(result, d)
+		seen[d.IP] = true
+	}
+	networkMu.RUnlock()
+
+	// Add DropSend peers not yet in ARP table
+	for ip, peer := range livePeers {
+		if !seen[ip] {
+			result = append(result, NetworkDevice{
+				IP:          ip,
+				Hostname:    peer.Name,
+				Name:        peer.Name,
+				HasDropSend: true,
+			})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// POST /scan — trigger an immediate network scan
+func scanHandler(w http.ResponseWriter, r *http.Request) {
+	go scanNetwork()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "scanning"})
 }
 
 func meHandler(w http.ResponseWriter, r *http.Request) {
@@ -413,9 +621,10 @@ func inboxHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(items)
 }
 
+// ── PEER DISCOVERY ───────────────────────────────────────────
+
 func startBeacon() {
 	for {
-		// Broadcast to entire subnet
 		addr, err := net.ResolveUDPAddr("udp", "255.255.255.255:9999")
 		if err != nil {
 			time.Sleep(beaconInterval)
@@ -446,15 +655,6 @@ func startListener() {
 		return
 	}
 	defer conn.Close()
-
-	// Allow receiving broadcast packets
-	rawConn, err := conn.SyscallConn()
-	if err == nil {
-		rawConn.Control(func(fd uintptr) {
-			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1)
-		})
-	}
-
 	buf := make([]byte, 1024)
 	for {
 		n, _, err := conn.ReadFromUDP(buf)
@@ -469,12 +669,17 @@ func startListener() {
 			continue
 		}
 		peersMu.Lock()
-		peers[msg.IP] = Peer{
-			Name:     msg.Name,
-			IP:       msg.IP,
-			LastSeen: time.Now(),
-		}
+		peers[msg.IP] = Peer{Name: msg.Name, IP: msg.IP, LastSeen: time.Now()}
 		peersMu.Unlock()
+
+		// Update network device to reflect DropSend status
+		networkMu.Lock()
+		if d, ok := networkDevices[msg.IP]; ok {
+			d.HasDropSend = true
+			d.Name = msg.Name
+			networkDevices[msg.IP] = d
+		}
+		networkMu.Unlock()
 	}
 }
 
@@ -491,6 +696,8 @@ func startPeerCleaner() {
 	}
 }
 
+// ── MAIN ─────────────────────────────────────────────────────
+
 func main() {
 	localIP = getLocalIP()
 	displayName = getHostname()
@@ -499,12 +706,15 @@ func main() {
 	go startBeacon()
 	go startListener()
 	go startPeerCleaner()
+	go startNetworkScanner()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/upload", uploadHandler)
 	mux.HandleFunc("/download/", downloadHandler)
 	mux.HandleFunc("/qr/", qrHandler)
 	mux.HandleFunc("/peers", peersHandler)
+	mux.HandleFunc("/network", networkHandler)
+	mux.HandleFunc("/scan", scanHandler)
 	mux.HandleFunc("/me", meHandler)
 	mux.HandleFunc("/setname", setNameHandler)
 	mux.HandleFunc("/send", sendToPeerHandler)
