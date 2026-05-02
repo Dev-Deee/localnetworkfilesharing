@@ -30,7 +30,6 @@ const (
 	port           = ":8080"
 	uploadDir      = "./uploads"
 	maxFileSize    = 200 << 20
-	multicastAddr  = "224.0.0.167:9999"
 	beaconInterval = 3 * time.Second
 	peerTimeout    = 10 * time.Second
 	scanInterval   = 30 * time.Second
@@ -172,29 +171,40 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 // ── NETWORK SCANNER ──────────────────────────────────────────
 
-// Ping a single IP (non-blocking, fire and forget)
 func pingIP(ip string) {
 	exec.Command("ping", "-c", "1", "-W", "1", ip).Run()
 }
 
-// Parse ARP table to get all known devices on the subnet
+// checkDropSend probes a device's port 8080 to see if DropSend is running
+func checkDropSend(ip string) (bool, string) {
+	client := &http.Client{Timeout: 1 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s:8080/me", ip))
+	if err != nil {
+		return false, ""
+	}
+	defer resp.Body.Close()
+	var me struct {
+		Name string `json:"name"`
+		IP   string `json:"ip"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&me); err != nil {
+		return false, ""
+	}
+	return true, me.Name
+}
+
 func readARPTable(subnetPrefix string) []NetworkDevice {
 	out, err := exec.Command("arp", "-a").Output()
 	if err != nil {
 		return nil
 	}
-
 	var devices []NetworkDevice
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Format: hostname (ip) at mac [ether] on iface
-		// or: ? (ip) at mac [ether] on iface
 		if !strings.Contains(line, subnetPrefix) {
 			continue
 		}
-
-		// Extract IP
 		start := strings.Index(line, "(")
 		end := strings.Index(line, ")")
 		if start == -1 || end == -1 {
@@ -204,17 +214,13 @@ func readARPTable(subnetPrefix string) []NetworkDevice {
 		if ip == localIP {
 			continue
 		}
-
-		// Extract hostname
-		hostname := "?"
+		hostname := "Unknown Device"
 		if start > 0 {
-			hostname = strings.TrimSpace(line[:start])
-			if hostname == "" || hostname == "?" {
-				hostname = "Unknown Device"
+			h := strings.TrimSpace(line[:start])
+			if h != "" && h != "?" {
+				hostname = h
 			}
 		}
-
-		// Extract MAC
 		mac := ""
 		parts := strings.Fields(line)
 		for i, p := range parts {
@@ -223,31 +229,27 @@ func readARPTable(subnetPrefix string) []NetworkDevice {
 				break
 			}
 		}
-
-		// Skip incomplete entries
 		if mac == "" || mac == "<incomplete>" {
 			continue
 		}
-
 		devices = append(devices, NetworkDevice{
 			IP:       ip,
 			Hostname: hostname,
 			MAC:      mac,
+			Name:     hostname,
 		})
 	}
 	return devices
 }
 
-// Full subnet scan: ping sweep then read ARP
 func scanNetwork() {
 	subnet := getSubnetPrefix(localIP)
 	if subnet == "" {
 		return
 	}
-
 	log.Printf("Scanning network %s.0/24...", subnet)
 
-	// Ping sweep concurrently
+	// Ping sweep
 	var wg sync.WaitGroup
 	for i := 1; i <= 254; i++ {
 		ip := fmt.Sprintf("%s.%d", subnet, i)
@@ -261,14 +263,12 @@ func scanNetwork() {
 		}(ip)
 	}
 	wg.Wait()
-
-	// Give ARP table time to settle
 	time.Sleep(2 * time.Second)
 
 	// Read ARP table
 	devices := readARPTable(subnet)
 
-	// Get current DropSend peers for cross-reference
+	// Get current DropSend peers
 	peersMu.RLock()
 	currentPeers := make(map[string]Peer)
 	for k, v := range peers {
@@ -276,30 +276,54 @@ func scanNetwork() {
 	}
 	peersMu.RUnlock()
 
-	// Update network devices map
+	// For each device, check DropSend status concurrently
+	var mu sync.Mutex
+	var checkWg sync.WaitGroup
+	for i := range devices {
+		checkWg.Add(1)
+		go func(idx int) {
+			defer checkWg.Done()
+			d := devices[idx]
+
+			// First check if we already know from UDP beacon
+			if peer, ok := currentPeers[d.IP]; ok {
+				mu.Lock()
+				devices[idx].HasDropSend = true
+				devices[idx].Name = peer.Name
+				mu.Unlock()
+				return
+			}
+
+			// Otherwise probe port 8080
+			hasDS, name := checkDropSend(d.IP)
+			mu.Lock()
+			devices[idx].HasDropSend = hasDS
+			if hasDS && name != "" {
+				devices[idx].Name = name
+				// Register as peer
+				peersMu.Lock()
+				peers[d.IP] = Peer{Name: name, IP: d.IP, LastSeen: time.Now()}
+				peersMu.Unlock()
+			}
+			mu.Unlock()
+		}(i)
+	}
+	checkWg.Wait()
+
+	// Update network map
 	networkMu.Lock()
 	networkDevices = make(map[string]NetworkDevice)
 	for _, d := range devices {
-		peer, hasPeer := currentPeers[d.IP]
-		if hasPeer {
-			d.HasDropSend = true
-			d.Name = peer.Name
-		} else {
-			d.HasDropSend = false
-			d.Name = d.Hostname
-		}
 		networkDevices[d.IP] = d
 	}
 	networkMu.Unlock()
 
-	log.Printf("Network scan complete: found %d devices", len(devices))
+	log.Printf("Scan complete: %d devices found", len(devices))
 }
 
 func startNetworkScanner() {
-	// First scan after 5 seconds (let app settle)
 	time.Sleep(5 * time.Second)
 	scanNetwork()
-
 	for {
 		time.Sleep(scanInterval)
 		scanNetwork()
@@ -320,7 +344,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxFileSize)
 	if err := r.ParseMultipartForm(maxFileSize); err != nil {
-		http.Error(w, "File too large. Maximum size is 200MB.", http.StatusBadRequest)
+		http.Error(w, "File too large. Maximum is 200MB.", http.StatusBadRequest)
 		return
 	}
 	file, handler, err := r.FormFile("file")
@@ -345,10 +369,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	record := FileRecord{
-		FileName:     fileName,
-		OriginalName: handler.Filename,
-		Token:        token,
-		ExpiresAt:    time.Now().Add(1 * time.Hour),
+		FileName: fileName, OriginalName: handler.Filename,
+		Token: token, ExpiresAt: time.Now().Add(1 * time.Hour),
 	}
 	fileStoreMu.Lock()
 	fileStore[token] = record
@@ -362,11 +384,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	qrURL := fmt.Sprintf("http://%s:8080/qr/%s", localIP, qrFileName)
 	resp := UploadResponse{
-		DownloadURL: downloadURL,
-		QRCodeURL:   qrURL,
-		FileName:    handler.Filename,
-		FileSize:    size,
-		Token:       token,
+		DownloadURL: downloadURL, QRCodeURL: qrURL,
+		FileName: handler.Filename, FileSize: size, Token: token,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -390,16 +409,8 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	fileStoreMu.RLock()
 	record, exists := fileStore[token]
 	fileStoreMu.RUnlock()
-	if !exists {
-		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
-		return
-	}
-	if time.Now().After(record.ExpiresAt) {
-		http.Error(w, "Link has expired", http.StatusGone)
-		return
-	}
-	if record.FileName != fileName {
-		http.Error(w, "Token mismatch", http.StatusUnauthorized)
+	if !exists || time.Now().After(record.ExpiresAt) || record.FileName != fileName {
+		http.Error(w, "Invalid or expired link", http.StatusUnauthorized)
 		return
 	}
 	filePath := filepath.Join(uploadDir, fileName)
@@ -416,25 +427,10 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 func qrHandler(w http.ResponseWriter, r *http.Request) {
 	fileName := filepath.Base(r.URL.Path)
-	filePath := filepath.Join(uploadDir, fileName)
-	http.ServeFile(w, r, filePath)
-}
-
-func peersHandler(w http.ResponseWriter, r *http.Request) {
-	peersMu.RLock()
-	defer peersMu.RUnlock()
-	list := []Peer{}
-	for _, p := range peers {
-		if time.Since(p.LastSeen) < peerTimeout {
-			list = append(list, p)
-		}
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(list)
+	http.ServeFile(w, r, filepath.Join(uploadDir, fileName))
 }
 
 func networkHandler(w http.ResponseWriter, r *http.Request) {
-	// Merge network devices with live DropSend peers
 	peersMu.RLock()
 	livePeers := make(map[string]Peer)
 	for k, v := range peers {
@@ -447,8 +443,6 @@ func networkHandler(w http.ResponseWriter, r *http.Request) {
 	networkMu.RLock()
 	result := []NetworkDevice{}
 	seen := make(map[string]bool)
-
-	// Add all network-scanned devices
 	for _, d := range networkDevices {
 		if peer, ok := livePeers[d.IP]; ok {
 			d.HasDropSend = true
@@ -459,14 +453,12 @@ func networkHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	networkMu.RUnlock()
 
-	// Add DropSend peers not yet in ARP table
+	// Add beacon-discovered peers not yet in ARP
 	for ip, peer := range livePeers {
 		if !seen[ip] {
 			result = append(result, NetworkDevice{
-				IP:          ip,
-				Hostname:    peer.Name,
-				Name:        peer.Name,
-				HasDropSend: true,
+				IP: ip, Hostname: peer.Name,
+				Name: peer.Name, HasDropSend: true,
 			})
 		}
 	}
@@ -475,7 +467,6 @@ func networkHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
-// POST /scan — trigger an immediate network scan
 func scanHandler(w http.ResponseWriter, r *http.Request) {
 	go scanNetwork()
 	w.Header().Set("Content-Type", "application/json")
@@ -525,22 +516,17 @@ func sendToPeerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	peerURL := fmt.Sprintf("http://%s:8080/receive", peerIP)
 	pr, pw := io.Pipe()
-	go func() {
-		defer pw.Close()
-		io.Copy(pw, file)
-	}()
-	req, err := http.NewRequest("POST", peerURL, pr)
+	go func() { defer pw.Close(); io.Copy(pw, file) }()
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://%s:8080/receive", peerIP), pr)
 	if err != nil {
-		http.Error(w, "Failed to create request to peer", http.StatusInternalServerError)
+		http.Error(w, "Failed to create request", http.StatusInternalServerError)
 		return
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Sender-Name", displayName)
 	req.Header.Set("X-File-Name", handler.Filename)
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{Timeout: 5 * time.Minute}).Do(req)
 	if err != nil {
 		http.Error(w, "Failed to reach peer: "+err.Error(), http.StatusBadGateway)
 		return
@@ -576,10 +562,8 @@ func receiveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	record := FileRecord{
-		FileName:     fileName,
-		OriginalName: originalName,
-		Token:        token,
-		ExpiresAt:    time.Now().Add(1 * time.Hour),
+		FileName: fileName, OriginalName: originalName,
+		Token: token, ExpiresAt: time.Now().Add(1 * time.Hour),
 	}
 	fileStoreMu.Lock()
 	fileStore[token] = record
@@ -646,12 +630,10 @@ func startBeacon() {
 func startListener() {
 	addr, err := net.ResolveUDPAddr("udp4", "0.0.0.0:9999")
 	if err != nil {
-		log.Println("Listener error:", err)
 		return
 	}
 	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
-		log.Println("UDP listen error:", err)
 		return
 	}
 	defer conn.Close()
@@ -671,13 +653,18 @@ func startListener() {
 		peersMu.Lock()
 		peers[msg.IP] = Peer{Name: msg.Name, IP: msg.IP, LastSeen: time.Now()}
 		peersMu.Unlock()
-
-		// Update network device to reflect DropSend status
+		// Update network device immediately when beacon received
 		networkMu.Lock()
 		if d, ok := networkDevices[msg.IP]; ok {
 			d.HasDropSend = true
 			d.Name = msg.Name
 			networkDevices[msg.IP] = d
+		} else {
+			// New peer not yet in ARP table — add it
+			networkDevices[msg.IP] = NetworkDevice{
+				IP: msg.IP, Hostname: msg.Name,
+				Name: msg.Name, HasDropSend: true,
+			}
 		}
 		networkMu.Unlock()
 	}
@@ -690,6 +677,13 @@ func startPeerCleaner() {
 		for ip, p := range peers {
 			if time.Since(p.LastSeen) > peerTimeout {
 				delete(peers, ip)
+				// Mark device as no longer having DropSend
+				networkMu.Lock()
+				if d, ok := networkDevices[ip]; ok {
+					d.HasDropSend = false
+					networkDevices[ip] = d
+				}
+				networkMu.Unlock()
 			}
 		}
 		peersMu.Unlock()
@@ -712,7 +706,6 @@ func main() {
 	mux.HandleFunc("/upload", uploadHandler)
 	mux.HandleFunc("/download/", downloadHandler)
 	mux.HandleFunc("/qr/", qrHandler)
-	mux.HandleFunc("/peers", peersHandler)
 	mux.HandleFunc("/network", networkHandler)
 	mux.HandleFunc("/scan", scanHandler)
 	mux.HandleFunc("/me", meHandler)
@@ -724,8 +717,6 @@ func main() {
 	stripped, _ := fs.Sub(staticFiles, "static")
 	mux.Handle("/", http.FileServer(http.FS(stripped)))
 
-	handler := corsMiddleware(mux)
-
 	fmt.Println("DropSend is running!")
 	fmt.Printf("Open:    http://localhost:8080\n")
 	fmt.Printf("Network: http://%s:8080\n", localIP)
@@ -736,5 +727,5 @@ func main() {
 		exec.Command("xdg-open", "http://localhost:8080").Start()
 	}()
 
-	log.Fatal(http.ListenAndServe(port, handler))
+	log.Fatal(http.ListenAndServe(port, corsMiddleware(mux)))
 }
